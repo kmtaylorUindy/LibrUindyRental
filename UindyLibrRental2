@@ -1,0 +1,246 @@
+// ============================
+// RUNS WHEN FORM IS SUBMITTED
+// ============================
+function onFormSubmit(e) {
+
+  try {
+
+    // Make sure this is triggered by a real form submission
+    if (!e || !e.response) {
+      throw new Error("This function must be run by a Google Form submit trigger.");
+    }
+
+    // Convert form responses into an easy-to-use object
+    const responses = getResponseMap_(e);
+
+    // Get each field from the form
+    const name = (responses["Name"] || "Student").toString().trim();
+    const email = (responses["Email"] || "").toString().trim();
+    const locker = (responses["Locker"] || "").toString().trim();
+    const timeSlot = (responses["Time Slot"] || "").toString().trim();
+    const item = (responses["Item"] || "Not specified").toString().trim();
+
+    // Make sure email exists
+    if (!email) throw new Error("Missing Email field.");
+
+    // Only allow @uindy.edu emails
+    if (!email.toLowerCase().endsWith("@uindy.edu")) {
+      Logger.log("Rejected non-UIndy email: " + email);
+      return; // stop the script
+    }
+
+    // Make sure required fields exist
+    if (!locker) throw new Error("Missing Locker field.");
+    if (!timeSlot) throw new Error("Missing Time Slot field.");
+
+    // Get the linked Google Sheet where responses are stored
+    const sheet = getResponseSheet_();
+
+    // Get or create needed columns in the sheet
+    const statusCol = getOrCreateColumn_(sheet, "Status");      // column for tracking state
+    const sentAtCol = getOrCreateColumn_(sheet, "Sent At");     // column for when email sent
+    const barcodeCol = getOrCreateColumn_(sheet, "Barcode Value"); // column for barcode value
+
+    // Get the row number of the latest submission
+    const currentRow = sheet.getLastRow();
+
+    // Convert the selected time slot into actual Date objects
+    const slotInfo = parseTimeSlotForToday_(timeSlot);
+
+    // Get current time
+    const now = new Date();
+
+    // ============================
+    // CHECK FOR DUPLICATE BOOKINGS
+    // ============================
+    if (isDuplicateActiveSlot_(sheet, locker, timeSlot, currentRow)) {
+
+      // Mark as rejected in sheet
+      sheet.getRange(currentRow, statusCol).setValue("REJECTED - SLOT ALREADY TAKEN");
+
+      // Send rejection email
+      GmailApp.sendEmail(
+        email,
+        "UIndy Library Locker Request Rejected",
+        "Hi " + name + ",\n\n" +
+        "Your request was rejected because " + locker + " is already taken during " + timeSlot + ".\n\n" +
+        "Item: " + item + "\n\n" +
+        "Please submit again with a different time or locker.\n\n" +
+        "Thanks,\nUIndy Library Rental"
+      );
+
+      return; // stop script
+    }
+
+    // ============================
+    // CHECK IF TIME SLOT EXPIRED
+    // ============================
+    if (now >= slotInfo.end) {
+
+      // Mark rejected
+      sheet.getRange(currentRow, statusCol).setValue("REJECTED - TIME SLOT EXPIRED");
+
+      // Send rejection email
+      GmailApp.sendEmail(
+        email,
+        "UIndy Library Locker Request Rejected",
+        "Hi " + name + ",\n\n" +
+        "Your selected time slot has already ended.\n\n" +
+        "Locker: " + locker + "\n" +
+        "Time Slot: " + timeSlot + "\n" +
+        "Item: " + item + "\n\n" +
+        "Please choose a valid time.\n\n" +
+        "Thanks,\nUIndy Library Rental"
+      );
+
+      return;
+    }
+
+    // ============================
+    // IF SLOT HAS NOT STARTED YET
+    // ============================
+    if (now < slotInfo.start) {
+
+      // Mark as pending
+      sheet.getRange(currentRow, statusCol).setValue("PENDING - NOT STARTED");
+
+      return; // do NOT send barcode yet
+    }
+
+    // ============================
+    // SLOT IS ACTIVE → SEND BARCODE
+    // ============================
+
+    // Generate rotating barcode value based on time slot
+    const barcodeText = generateBarcodeValueFromTimeSlot_(timeSlot);
+
+    // Send email with barcode
+    sendBarcodeEmail_(email, name, locker, timeSlot, item, barcodeText);
+
+    // Update sheet
+    sheet.getRange(currentRow, statusCol).setValue("SENT");
+    sheet.getRange(currentRow, sentAtCol).setValue(new Date());
+    sheet.getRange(currentRow, barcodeCol).setValue(barcodeText);
+
+  } catch (err) {
+
+    // Log errors for debugging
+    Logger.log("Error in onFormSubmit: " + err.message);
+    throw err;
+  }
+}
+
+//////////////////////////////////////////////////////
+// RUNS EVERY MINUTE → SENDS PENDING BARCODES
+//////////////////////////////////////////////////////
+function sendPendingBarcodes() {
+
+  const sheet = getResponseSheet_(); // get sheet
+  const data = sheet.getDataRange().getValues(); // get all rows
+
+  if (data.length < 2) return; // no data
+
+  const headers = data[0]; // first row (column names)
+
+  // Find column indexes
+  const nameCol = headers.indexOf("Name");
+  const emailCol = headers.indexOf("Email");
+  const lockerCol = headers.indexOf("Locker");
+  const timeSlotCol = headers.indexOf("Time Slot");
+  const itemCol = headers.indexOf("Item");
+  const statusCol = headers.indexOf("Status");
+
+  const now = new Date();
+
+  // Loop through each row
+  for (let r = 1; r < data.length; r++) {
+
+    const rowNumber = r + 1;
+
+    // Get row values
+    const name = data[r][nameCol];
+    const email = data[r][emailCol];
+    const locker = data[r][lockerCol];
+    const timeSlot = data[r][timeSlotCol];
+    const item = data[r][itemCol];
+    const status = data[r][statusCol];
+
+    // Only process pending rows
+    if (status !== "PENDING - NOT STARTED") continue;
+
+    // Parse time slot
+    const slotInfo = parseTimeSlotForToday_(timeSlot);
+
+    // If expired → reject
+    if (now >= slotInfo.end) {
+      sheet.getRange(rowNumber, statusCol + 1).setValue("REJECTED - TIME SLOT EXPIRED");
+      continue;
+    }
+
+    // If slot has started → send barcode
+    if (now >= slotInfo.start) {
+
+      const barcodeText = generateBarcodeValueFromTimeSlot_(timeSlot);
+
+      sendBarcodeEmail_(email, name, locker, timeSlot, item, barcodeText);
+
+      sheet.getRange(rowNumber, statusCol + 1).setValue("SENT");
+    }
+  }
+}
+
+//////////////////////////////////////////////////////
+// SEND EMAIL WITH BARCODE
+//////////////////////////////////////////////////////
+function sendBarcodeEmail_(email, name, locker, timeSlot, item, barcodeText) {
+
+  // Create barcode image URL
+  const barcodeUrl =
+    "https://barcode.tec-it.com/barcode.ashx?data=" +
+    encodeURIComponent(barcodeText) +
+    "&code=Code128";
+
+  // Fetch image
+  const barcodeBlob = UrlFetchApp.fetch(barcodeUrl).getBlob();
+
+  // Send email
+  GmailApp.sendEmail(
+    email,
+    "Your Locker Barcode",
+    "Hi " + name + ", your barcode is attached.",
+    {
+      htmlBody:
+        "<p><b>Locker:</b> " + locker + "</p>" +
+        "<p><b>Time:</b> " + timeSlot + "</p>" +
+        "<p><b>Item:</b> " + item + "</p>" +
+        "<p><img src='cid:barcode'></p>" +
+        "<p>Value: " + barcodeText + "</p>",
+      inlineImages: { barcode: barcodeBlob }
+    }
+  );
+}
+
+//////////////////////////////////////////////////////
+// GENERATE BARCODE VALUE BASED ON TIME SLOT
+//////////////////////////////////////////////////////
+function generateBarcodeValueFromTimeSlot_(timeSlot) {
+
+  const parts = timeSlot.split(" - "); // split start/end
+  const startTime = parts[0].trim();
+
+  const hour = parseHour24_(startTime); // convert to 24-hour
+
+  // Calculate step from 6 AM
+  const step = ((hour - 6) + 24) % 24;
+
+  let value = 12345678; // starting value
+
+  // Apply formula step times
+  for (let i = 0; i < step; i++) {
+    value = ((value * 2) - 950000) % 1000000000;
+
+    if (value < 0) value += 1000000000; // fix negative wrap
+  }
+
+  return value.toString();
+}
