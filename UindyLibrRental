@@ -1,0 +1,326 @@
+function onFormSubmit(e) {
+  try {
+    if (!e || !e.response) {
+      throw new Error("This function must be run by a Google Form submit trigger.");
+    }
+
+    const responses = getResponseMap_(e);
+    const name = (responses["Name"] || "Student").toString().trim();
+    const email = (responses["Email"] || "").toString().trim();
+    const locker = (responses["Locker"] || "").toString().trim();
+    const timeSlot = (responses["Time Slot"] || "").toString().trim();
+    const item = (responses["Item"] || "Not specified").toString().trim();
+
+    if (!email) throw new Error("Missing Email field.");
+    if (!email.toLowerCase().endsWith("@uindy.edu")) {
+      Logger.log("Rejected non-UIndy email: " + email);
+      return;
+    }
+    if (!locker) throw new Error("Missing Locker field.");
+    if (!timeSlot) throw new Error("Missing Time Slot field.");
+
+    const sheet = getResponseSheet_();
+    const statusCol = getOrCreateColumn_(sheet, "Status");
+    const sentAtCol = getOrCreateColumn_(sheet, "Sent At");
+    const barcodeCol = getOrCreateColumn_(sheet, "Barcode Value");
+    const currentRow = sheet.getLastRow();
+
+    const slotInfo = parseTimeSlotForToday_(timeSlot);
+    const now = new Date();
+
+    if (isDuplicateActiveSlot_(sheet, locker, timeSlot, currentRow)) {
+      sheet.getRange(currentRow, statusCol).setValue("REJECTED - SLOT ALREADY TAKEN");
+
+      GmailApp.sendEmail(
+        email,
+        "UIndy Library Locker Request Rejected",
+        "Hi " + name + ",\n\n" +
+        "Your request was rejected because " + locker + " is already taken during " + timeSlot + ".\n\n" +
+        "Item: " + item + "\n\n" +
+        "Please submit the form again with a different locker or time slot.\n\n" +
+        "Thanks,\nUIndy Library Rental"
+      );
+      return;
+    }
+
+    if (now >= slotInfo.end) {
+      sheet.getRange(currentRow, statusCol).setValue("REJECTED - TIME SLOT EXPIRED");
+
+      GmailApp.sendEmail(
+        email,
+        "UIndy Library Locker Request Rejected",
+        "Hi " + name + ",\n\n" +
+        "Your request was rejected because the selected time slot has already ended.\n\n" +
+        "Locker: " + locker + "\n" +
+        "Time Slot: " + timeSlot + "\n" +
+        "Item: " + item + "\n\n" +
+        "Please submit the form again with a current or future time slot.\n\n" +
+        "Thanks,\nUIndy Library Rental"
+      );
+      return;
+    }
+
+    if (now < slotInfo.start) {
+      sheet.getRange(currentRow, statusCol).setValue("PENDING - NOT STARTED");
+      return;
+    }
+
+    const barcodeText = generateBarcodeValueFromTimeSlot_(timeSlot);
+    sendBarcodeEmail_(email, name, locker, timeSlot, item, barcodeText);
+
+    sheet.getRange(currentRow, statusCol).setValue("SENT");
+    sheet.getRange(currentRow, sentAtCol).setValue(new Date());
+    sheet.getRange(currentRow, barcodeCol).setValue(barcodeText);
+
+  } catch (err) {
+    Logger.log("Error in onFormSubmit: " + err.message);
+    throw err;
+  }
+}
+
+function sendPendingBarcodes() {
+  const sheet = getResponseSheet_();
+  const data = sheet.getDataRange().getValues();
+  if (data.length < 2) return;
+
+  const headers = data[0];
+  const nameCol = headers.indexOf("Name");
+  const emailCol = headers.indexOf("Email");
+  const lockerCol = headers.indexOf("Locker");
+  const timeSlotCol = headers.indexOf("Time Slot");
+  const itemCol = headers.indexOf("Item");
+  const statusCol = headers.indexOf("Status");
+  const sentAtCol = getOrCreateColumn_(sheet, "Sent At") - 1;
+  const barcodeCol = getOrCreateColumn_(sheet, "Barcode Value") - 1;
+
+  if ([nameCol, emailCol, lockerCol, timeSlotCol, itemCol, statusCol].includes(-1)) {
+    throw new Error("Missing one or more required columns in the response sheet.");
+  }
+
+  const now = new Date();
+
+  for (let r = 1; r < data.length; r++) {
+    const rowNumber = r + 1;
+    const name = (data[r][nameCol] || "Student").toString().trim();
+    const email = (data[r][emailCol] || "").toString().trim();
+    const locker = (data[r][lockerCol] || "").toString().trim();
+    const timeSlot = (data[r][timeSlotCol] || "").toString().trim();
+    const item = (data[r][itemCol] || "Not specified").toString().trim();
+    const status = (data[r][statusCol] || "").toString().trim();
+
+    if (status !== "PENDING - NOT STARTED") continue;
+    if (!email || !locker || !timeSlot) continue;
+
+    const slotInfo = parseTimeSlotForToday_(timeSlot);
+
+    if (now >= slotInfo.end) {
+      sheet.getRange(rowNumber, statusCol + 1).setValue("REJECTED - TIME SLOT EXPIRED");
+      continue;
+    }
+
+    if (now >= slotInfo.start && now < slotInfo.end) {
+      const barcodeText = generateBarcodeValueFromTimeSlot_(timeSlot);
+      sendBarcodeEmail_(email, name, locker, timeSlot, item, barcodeText);
+
+      sheet.getRange(rowNumber, statusCol + 1).setValue("SENT");
+      sheet.getRange(rowNumber, sentAtCol + 1).setValue(new Date());
+      sheet.getRange(rowNumber, barcodeCol + 1).setValue(barcodeText);
+    }
+  }
+}
+
+function sendBarcodeEmail_(email, name, locker, timeSlot, item, barcodeText) {
+  const barcodeUrl =
+    "https://barcode.tec-it.com/barcode.ashx?data=" +
+    encodeURIComponent(barcodeText) +
+    "&code=Code128&translate-esc=false";
+
+  const barcodeBlob = UrlFetchApp.fetch(barcodeUrl)
+    .getBlob()
+    .setName("locker_barcode.png");
+
+  const subject = "Your UIndy Library Locker Barcode";
+
+  const plainBody =
+    "Hi " + name + ",\n\n" +
+    "Here is your barcode for " + locker + ".\n" +
+    "Time Slot: " + timeSlot + "\n" +
+    "Item: " + item + "\n" +
+    "Barcode value: " + barcodeText + "\n\n" +
+    "Please keep this barcode for your locker access.\n\n" +
+    "Thanks,\nUIndy Library Rental";
+
+  const htmlBody =
+    "<p>Hi " + name + ",</p>" +
+    "<p>Here is your barcode for <b>" + locker + "</b>.</p>" +
+    "<p><b>Time Slot:</b> " + timeSlot + "</p>" +
+    "<p><b>Item:</b> " + item + "</p>" +
+    "<p><img src='cid:lockerBarcode'></p>" +
+    "<p><b>Barcode value:</b> " + barcodeText + "</p>" +
+    "<p>Please keep this barcode for your locker access.</p>" +
+    "<p>Thanks,<br>UIndy Library Rental</p>";
+
+  GmailApp.sendEmail(email, subject, plainBody, {
+    htmlBody: htmlBody,
+    inlineImages: {
+      lockerBarcode: barcodeBlob
+    }
+  });
+}
+
+function getResponseMap_(e) {
+  const itemResponses = e.response.getItemResponses();
+  const responses = {};
+  itemResponses.forEach(function(r) {
+    responses[r.getItem().getTitle()] = r.getResponse();
+  });
+  return responses;
+}
+
+function getResponseSheet_() {
+  const form = FormApp.getActiveForm();
+  const destId = form.getDestinationId();
+  if (!destId) {
+    throw new Error("This form is not linked to a response spreadsheet yet.");
+  }
+  const ss = SpreadsheetApp.openById(destId);
+  return ss.getSheets()[0];
+}
+
+function getOrCreateColumn_(sheet, headerName) {
+  const lastCol = sheet.getLastColumn();
+  const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+
+  for (let i = 0; i < headers.length; i++) {
+    if (headers[i].toString().trim() === headerName) {
+      return i + 1;
+    }
+  }
+
+  const newCol = lastCol + 1;
+  sheet.getRange(1, newCol).setValue(headerName);
+  return newCol;
+}
+
+function isDuplicateActiveSlot_(sheet, locker, timeSlot, currentRow) {
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0];
+
+  const lockerCol = headers.indexOf("Locker");
+  const timeSlotCol = headers.indexOf("Time Slot");
+  const statusCol = headers.indexOf("Status");
+
+  if (lockerCol === -1 || timeSlotCol === -1) {
+    throw new Error("Could not find Locker or Time Slot columns in response sheet.");
+  }
+
+  let activeMatches = 0;
+
+  for (let r = 1; r < data.length; r++) {
+    const rowLocker = (data[r][lockerCol] || "").toString().trim();
+    const rowTimeSlot = (data[r][timeSlotCol] || "").toString().trim();
+    const rowStatus = statusCol === -1 ? "" : (data[r][statusCol] || "").toString().trim();
+
+    if (rowLocker === locker && rowTimeSlot === timeSlot) {
+      if (!rowStatus.startsWith("REJECTED")) {
+        activeMatches++;
+      }
+    }
+  }
+
+  return activeMatches > 1;
+}
+
+function parseTimeSlotForToday_(timeSlot) {
+  const parts = timeSlot.split(" - ");
+  if (parts.length !== 2) {
+    throw new Error("Invalid Time Slot format: " + timeSlot);
+  }
+
+  const now = new Date();
+  const start = buildTodayTime_(parts[0].trim(), now);
+  const end = buildTodayTime_(parts[1].trim(), now);
+
+  if (end <= start) {
+    end.setDate(end.getDate() + 1);
+  }
+
+  return { start: start, end: end };
+}
+
+function buildTodayTime_(timeStr, baseDate) {
+  const match = timeStr.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+  if (!match) {
+    throw new Error("Invalid time format: " + timeStr);
+  }
+
+  let hour = parseInt(match[1], 10);
+  const minute = parseInt(match[2], 10);
+  const ampm = match[3].toUpperCase();
+
+  if (ampm === "AM" && hour === 12) {
+    hour = 0;
+  } else if (ampm === "PM" && hour !== 12) {
+    hour += 12;
+  }
+
+  const d = new Date(baseDate);
+  d.setHours(hour, minute, 0, 0);
+  return d;
+}
+
+function generateBarcodeValueFromTimeSlot_(timeSlot) {
+  const parts = timeSlot.split(" - ");
+  if (parts.length !== 2) {
+    throw new Error("Invalid Time Slot format: " + timeSlot);
+  }
+
+  const startTime = parts[0].trim();
+  const slotHour24 = parseHour24_(startTime);
+
+  const step = ((slotHour24 - 6) + 24) % 24;
+
+  let value = 12345678;
+
+  for (let i = 0; i < step; i++) {
+    value = ((value * 2) - 950000) % 1000000000;
+    if (value < 0) value += 1000000000;
+  }
+
+  return value.toString();
+}
+
+function parseHour24_(timeStr) {
+  const match = timeStr.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+  if (!match) {
+    throw new Error("Invalid time format: " + timeStr);
+  }
+
+  let hour = parseInt(match[1], 10);
+  const ampm = match[3].toUpperCase();
+
+  if (ampm === "AM" && hour === 12) {
+    hour = 0;
+  } else if (ampm === "PM" && hour !== 12) {
+    hour += 12;
+  }
+
+  return hour;
+}
+
+/**
+ * Run once manually to create the every-minute trigger.
+ */
+function createPendingBarcodeTrigger() {
+  const triggers = ScriptApp.getProjectTriggers();
+  for (let i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === "sendPendingBarcodes") {
+      return;
+    }
+  }
+
+  ScriptApp.newTrigger("sendPendingBarcodes")
+    .timeBased()
+    .everyMinutes(1)
+    .create();
+}
